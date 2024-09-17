@@ -1,0 +1,13 @@
+.{
+    .name = "zig-ui",
+    .version = "0.0.0",
+
+    .dependencies = .{
+        .raylib = .{
+            .url = "git+https://github.com/Not-Nik/raylib-zig#f26b2ab084be5e2840b7451818590cc512b7b972",
+            .hash = "1220fc554f109a45a77ee5c58b4a847936dc0b24dcbed818b65a02de1b58500041dc",
+        },
+    },
+
+    .paths = .{""},
+}
