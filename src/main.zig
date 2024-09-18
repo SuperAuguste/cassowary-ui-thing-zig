@@ -365,10 +365,19 @@ pub fn Solver(comptime Float: type) type {
             }
         };
 
+        const ErrorVariables = struct {
+            positive: Variable,
+            negative: Variable,
+        };
+
         next_variable_id: Variable.Id = @enumFromInt(0),
 
         objective_function: Row = .{},
         rows: std.AutoArrayHashMapUnmanaged(Variable, Row) = .{},
+
+        // TODO: probably just return these at construction
+        // and let user pass them back in
+        error_variables: std.AutoArrayHashMapUnmanaged(Variable, ErrorVariables) = .{},
 
         fn debugPrint(
             solver: @This(),
@@ -420,13 +429,14 @@ pub fn Solver(comptime Float: type) type {
             };
         }
 
+        /// Simplex optimization
         fn optimize(solver: *@This(), allocator: Allocator) !void {
             while (true) {
-                const entry_variable = entry: for (
+                const entry_variable = for (
                     solver.objective_function.terms.keys(),
                     solver.objective_function.terms.values(),
                 ) |variable, coefficient| {
-                    if (coefficient < 0) break :entry variable;
+                    if (coefficient < 0) break variable;
                 } else break;
 
                 var min = std.math.inf(Float);
@@ -458,11 +468,62 @@ pub fn Solver(comptime Float: type) type {
                 exit_row.solveFor(exit_variable);
                 try solver.objective_function.replaceVariable(allocator, exit_row, exit_variable);
 
-                for (variables) |simplex_variable| {
-                    if (simplex_variable.kind == .external) continue;
-                    if (simplex_variable.id == exit_variable.id) continue;
+                for (variables) |variable| {
+                    if (variable.id == exit_variable.id) continue;
 
-                    const row = solver.rows.getPtr(simplex_variable).?;
+                    const row = solver.rows.getPtr(variable).?;
+                    try row.replaceVariable(
+                        allocator,
+                        exit_row,
+                        exit_variable,
+                    );
+                }
+
+                _ = solver.rows.swapRemove(exit_variable);
+                try solver.rows.put(allocator, entry_variable, exit_row);
+            }
+        }
+
+        /// Dual of the simplex optimization
+        fn dualOptimize(solver: *@This(), allocator: Allocator) !void {
+            while (true) {
+                const variables = solver.rows.keys();
+
+                const exit_variable, var exit_row = for (
+                    variables,
+                    solver.rows.values(),
+                ) |variable, row| {
+                    if (variable.kind == .external) continue;
+
+                    if (row.constant < 0) break .{ variable, row };
+                } else break;
+
+                var min = std.math.inf(Float);
+                var maybe_entry_variable: ?Variable = null;
+
+                for (
+                    solver.objective_function.terms.keys(),
+                    solver.objective_function.terms.values(),
+                ) |variable, coefficient| {
+                    const new_min =
+                        -coefficient /
+                        (exit_row.terms.get(variable) orelse continue);
+
+                    if (new_min < min) {
+                        min = new_min;
+                        maybe_entry_variable = variable;
+                    }
+                }
+
+                const entry_variable = maybe_entry_variable.?;
+
+                exit_row.solveFor(exit_variable);
+                try solver.objective_function.replaceVariable(allocator, exit_row, exit_variable);
+
+                for (variables) |variable| {
+                    if (variable.id == exit_variable.id) continue;
+
+                    const row = solver.rows.getPtr(variable).?;
                     try row.replaceVariable(
                         allocator,
                         exit_row,
@@ -547,6 +608,13 @@ pub fn Solver(comptime Float: type) type {
                             error_variable_negative,
                             constraint.strength,
                         );
+
+                        // TODO
+                        assert(new_row_basic_variable.?.id != error_variable_positive.id);
+                        try solver.error_variables.put(allocator, new_row_basic_variable.?, .{
+                            .positive = error_variable_positive,
+                            .negative = error_variable_negative,
+                        });
                     }
                 },
             }
@@ -566,19 +634,48 @@ pub fn Solver(comptime Float: type) type {
                 try solver.rows.put(allocator, basic_variable, row);
             } else {
                 assert(constraint.strength >= strengths.required);
-                // TODO
+                @panic("TODO");
             }
 
             try solver.optimize(allocator);
         }
 
-        pub fn getExternalVariableValue(solver: @This(), variable: Variable) Float {
+        pub fn getValue(solver: @This(), variable: Variable) Float {
             assert(variable.kind == .external);
             const row = solver.rows.get(variable).?;
             for (row.terms.keys()) |term| {
                 assert(term.kind != .external);
             }
             return row.constant;
+        }
+
+        /// Suggests new value for variable inserted with a constraint of
+        /// the form `variable = constant` with `strength < strengths.required`.
+        pub fn suggestValue(
+            solver: *@This(),
+            allocator: Allocator,
+            variable: Variable,
+            value: Float,
+        ) !void {
+            const row = solver.rows.get(variable).?;
+            const delta = value - row.constant;
+
+            // TODO: store previous value to determine delta properly
+
+            const error_variables = solver.error_variables.get(variable).?;
+
+            if (solver.rows.getPtr(error_variables.positive)) |error_variable_positive_row| {
+                try error_variable_positive_row.addTerm(allocator, variable, -delta);
+            } else if (solver.rows.getPtr(error_variables.negative)) |error_variable_negative_row| {
+                try error_variable_negative_row.addTerm(allocator, variable, delta);
+            } else {
+                for (solver.rows.values()) |*dest_row| {
+                    dest_row.constant +=
+                        delta * (row.terms.get(error_variables.positive) orelse continue);
+                }
+            }
+
+            try solver.dualOptimize(allocator);
         }
     };
 }
@@ -592,8 +689,9 @@ pub fn main() !void {
     const x_m = solver.newExternalVariable();
     const x_l = solver.newExternalVariable();
     const x_r = solver.newExternalVariable();
+    const upper_bound = solver.newExternalVariable();
 
-    const variables = .{ .x_m = x_m, .x_l = x_l, .x_r = x_r };
+    const variables = .{ .x_m = x_m, .x_l = x_l, .x_r = x_r, .upper_bound = upper_bound };
 
     try solver.addConstraint(allocator, try .parse(
         allocator,
@@ -619,13 +717,28 @@ pub fn main() !void {
     try solver.addConstraint(allocator, try .parse(
         allocator,
         strengths.strong,
-        "x_r <= 100.0",
+        "x_r <= upper_bound",
+        variables,
+    ));
+
+    try solver.addConstraint(allocator, try .parse(
+        allocator,
+        strengths.strong,
+        "upper_bound = 100.0",
         variables,
     ));
 
     try solver.debugPrint(std.io.getStdOut().writer());
 
-    std.log.info("x_m = {d}", .{solver.getExternalVariableValue(x_m)});
-    std.log.info("x_l = {d}", .{solver.getExternalVariableValue(x_l)});
-    std.log.info("x_r = {d}", .{solver.getExternalVariableValue(x_r)});
+    std.log.info("x_m = {d}", .{solver.getValue(x_m)});
+    std.log.info("x_l = {d}", .{solver.getValue(x_l)});
+    std.log.info("x_r = {d}", .{solver.getValue(x_r)});
+
+    try solver.suggestValue(allocator, upper_bound, 105);
+
+    try solver.debugPrint(std.io.getStdOut().writer());
+
+    std.log.info("x_m = {d}", .{solver.getValue(x_m)});
+    std.log.info("x_l = {d}", .{solver.getValue(x_l)});
+    std.log.info("x_r = {d}", .{solver.getValue(x_r)});
 }
