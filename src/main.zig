@@ -2,7 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
-const ConstraintTokenizer = struct {
+pub const ConstraintTokenizer = struct {
     const Tag = enum {
         invalid,
         float,
@@ -150,21 +150,31 @@ pub fn Constraint(comptime Float: type) type {
     return struct {
         pub const Operator = enum { eq, lte, gte };
 
-        expression: Solver(Float).Row,
+        variables: []const Variable,
+        coefficients: []const Float,
+        constant: Float,
+
         operator: Operator,
         strength: Float,
 
-        fn parse(
+        pub fn parse(
             allocator: Allocator,
+            buffer_row: *Solver(Float).Row,
             strength: Float,
             comptime text: [:0]const u8,
             variables: anytype,
         ) !@This() {
             var constraint: @This() = .{
-                .expression = .{},
+                .variables = undefined,
+                .coefficients = undefined,
+                .constant = undefined,
+
                 .operator = undefined,
                 .strength = strength,
             };
+
+            buffer_row.constant = 0;
+            buffer_row.terms.shrinkRetainingCapacity(0);
 
             comptime var tokenizer = ConstraintTokenizer{ .buffer = text };
             comptime var state: enum { at_term, post_term, post_float, post_asterisk } = .at_term;
@@ -192,7 +202,7 @@ pub fn Constraint(comptime Float: type) type {
                             state = .post_float;
                         },
                         .variable => {
-                            try constraint.expression.addTerm(
+                            try buffer_row.addTerm(
                                 allocator,
                                 @field(variables, text[token.start..token.end]),
                                 side.coefficient(),
@@ -223,25 +233,25 @@ pub fn Constraint(comptime Float: type) type {
                             constraint.operator = .gte;
                             state = .at_term;
                         },
-                        .end => return constraint,
+                        .end => break,
                         else => @compileError("Invalid " ++ @tagName(token.tag) ++ ": " ++ text[token.start..token.end]),
                     },
                     .post_float => switch (token.tag) {
                         .plus => {
-                            constraint.expression.constant += side.coefficient() * withheld_float;
+                            buffer_row.constant += side.coefficient() * withheld_float;
                             withheld_float = undefined;
                             state = .at_term;
                         },
                         .end => {
-                            constraint.expression.constant += side.coefficient() * withheld_float;
+                            buffer_row.constant += side.coefficient() * withheld_float;
                             withheld_float = undefined;
-                            return constraint;
+                            break;
                         },
                         .asterisk => {
                             state = .post_asterisk;
                         },
                         .equal => {
-                            constraint.expression.constant += side.coefficient() * withheld_float;
+                            buffer_row.constant += side.coefficient() * withheld_float;
                             withheld_float = undefined;
 
                             if (side != .left) @compileError("Constraint cannot have two operators");
@@ -250,7 +260,7 @@ pub fn Constraint(comptime Float: type) type {
                             state = .at_term;
                         },
                         .left_angle_bracket_equal => {
-                            constraint.expression.constant += side.coefficient() * withheld_float;
+                            buffer_row.constant += side.coefficient() * withheld_float;
                             withheld_float = undefined;
 
                             if (side != .left) @compileError("Constraint cannot have two operators");
@@ -259,7 +269,7 @@ pub fn Constraint(comptime Float: type) type {
                             state = .at_term;
                         },
                         .right_angle_bracket_equal => {
-                            constraint.expression.constant += side.coefficient() * withheld_float;
+                            buffer_row.constant += side.coefficient() * withheld_float;
                             withheld_float = undefined;
 
                             if (side != .left) @compileError("Constraint cannot have two operators");
@@ -271,7 +281,7 @@ pub fn Constraint(comptime Float: type) type {
                     },
                     .post_asterisk => switch (token.tag) {
                         .variable => {
-                            try constraint.expression.addTerm(
+                            try buffer_row.addTerm(
                                 allocator,
                                 @field(variables, text[token.start..token.end]),
                                 side.coefficient() * withheld_float,
@@ -284,16 +294,25 @@ pub fn Constraint(comptime Float: type) type {
                 }
             }
 
-            unreachable;
+            constraint.variables = buffer_row.terms.keys();
+            constraint.coefficients = buffer_row.terms.values();
+            constraint.constant = buffer_row.constant;
+
+            return constraint;
         }
     };
 }
 
 pub fn Solver(comptime Float: type) type {
     return struct {
-        const Row = struct {
+        pub const Row = struct {
             terms: std.AutoArrayHashMapUnmanaged(Variable, Float) = .{},
             constant: Float = 0,
+
+            pub fn deinit(row: *Row, allocator: Allocator) void {
+                row.terms.deinit(allocator);
+                row.* = undefined;
+            }
 
             pub fn addTerm(
                 row: *Row,
@@ -306,17 +325,6 @@ pub fn Solver(comptime Float: type) type {
                 if (gop.value_ptr.* == 0) {
                     assert(row.terms.swapRemove(variable));
                 }
-            }
-
-            pub fn addRow(
-                dest_row: *Row,
-                allocator: Allocator,
-                src_row: Row,
-            ) error{OutOfMemory}!void {
-                for (src_row.terms.keys(), src_row.terms.values()) |variable, coefficient| {
-                    try dest_row.addTerm(allocator, variable, coefficient);
-                }
-                dest_row.constant += src_row.constant;
             }
 
             /// `solveFor` will make the coefficient of the selected
@@ -365,9 +373,11 @@ pub fn Solver(comptime Float: type) type {
             }
         };
 
-        const ErrorVariables = struct {
-            positive: Variable,
-            negative: Variable,
+        pub const EditVariable = struct {
+            variable: Variable,
+            positive_error: Variable,
+            negative_error: Variable,
+            current_value: Float,
         };
 
         next_variable_id: Variable.Id = @enumFromInt(0),
@@ -375,9 +385,14 @@ pub fn Solver(comptime Float: type) type {
         objective_function: Row = .{},
         rows: std.AutoArrayHashMapUnmanaged(Variable, Row) = .{},
 
-        // TODO: probably just return these at construction
-        // and let user pass them back in
-        error_variables: std.AutoArrayHashMapUnmanaged(Variable, ErrorVariables) = .{},
+        pub fn deinit(solver: *@This(), allocator: Allocator) void {
+            solver.objective_function.deinit(allocator);
+            for (solver.rows.values()) |*row| {
+                row.deinit(allocator);
+            }
+            solver.rows.deinit(allocator);
+            solver.* = undefined;
+        }
 
         fn debugPrint(
             solver: @This(),
@@ -461,8 +476,6 @@ pub fn Solver(comptime Float: type) type {
 
                 const exit_variable = maybe_exit_variable.?;
 
-                std.log.info("{any} {any}", .{ entry_variable, exit_variable });
-
                 var exit_row = solver.rows.get(exit_variable).?;
 
                 exit_row.solveFor(exit_variable);
@@ -541,16 +554,45 @@ pub fn Solver(comptime Float: type) type {
             allocator: Allocator,
             constraint: Constraint(Float),
         ) !void {
-            var row = Row{ .constant = constraint.expression.constant };
+            return solver.addConstraintInternal(allocator, constraint, null);
+        }
+
+        pub fn addEditVariable(
+            solver: *@This(),
+            allocator: Allocator,
+            strength: Float,
+            initial_value: Float,
+        ) !EditVariable {
+            var edit_variable: EditVariable = undefined;
+
+            try solver.addConstraintInternal(allocator, .{
+                .variables = &.{solver.newExternalVariable()},
+                .coefficients = &.{1},
+                .constant = -initial_value,
+
+                .operator = .eq,
+                .strength = strength,
+            }, &edit_variable);
+
+            return edit_variable;
+        }
+
+        fn addConstraintInternal(
+            solver: *@This(),
+            allocator: Allocator,
+            constraint: Constraint(Float),
+            edit_variable: ?*EditVariable,
+        ) !void {
+            assert(constraint.variables.len == constraint.coefficients.len);
+
+            var row = Row{ .constant = constraint.constant };
 
             var new_row_basic_variable: ?Variable = null;
 
-            const constraint_variables = constraint.expression.terms.keys();
-            const constraint_coefficients = constraint.expression.terms.values();
-
-            for (constraint_variables, constraint_coefficients) |variable, coefficient| {
+            for (constraint.variables, constraint.coefficients) |variable, coefficient| {
                 if (solver.rows.get(variable)) |existing_row| {
-                    try row.addRow(allocator, existing_row);
+                    try row.addTerm(allocator, variable, coefficient);
+                    try row.replaceVariable(allocator, existing_row, variable);
                 } else {
                     if (new_row_basic_variable == null) {
                         new_row_basic_variable = variable;
@@ -584,6 +626,8 @@ pub fn Solver(comptime Float: type) type {
                             constraint.strength,
                         );
                     }
+
+                    assert(edit_variable == null);
                 },
                 .eq => {
                     if (constraint.strength < strengths.required) {
@@ -609,12 +653,20 @@ pub fn Solver(comptime Float: type) type {
                             constraint.strength,
                         );
 
-                        // TODO
-                        assert(new_row_basic_variable.?.id != error_variable_positive.id);
-                        try solver.error_variables.put(allocator, new_row_basic_variable.?, .{
-                            .positive = error_variable_positive,
-                            .negative = error_variable_negative,
-                        });
+                        if (edit_variable) |info| {
+                            assert(constraint.coefficients.len == 1);
+                            assert(new_row_basic_variable.?.id == constraint.variables[0].id);
+                            assert(constraint.coefficients[0] == 1);
+
+                            info.* = .{
+                                .variable = constraint.variables[0],
+                                .positive_error = error_variable_positive,
+                                .negative_error = error_variable_negative,
+                                .current_value = -constraint.constant,
+                            };
+                        }
+                    } else {
+                        assert(edit_variable == null);
                     }
                 },
             }
@@ -654,47 +706,54 @@ pub fn Solver(comptime Float: type) type {
         pub fn suggestValue(
             solver: *@This(),
             allocator: Allocator,
-            variable: Variable,
+            edit_variable: *EditVariable,
             value: Float,
         ) !void {
-            const row = solver.rows.get(variable).?;
-            const delta = value - row.constant;
+            const row = solver.rows.get(edit_variable.variable).?;
 
-            // TODO: store previous value to determine delta properly
+            const delta = value - edit_variable.current_value;
+            edit_variable.current_value = value;
 
-            const error_variables = solver.error_variables.get(variable).?;
-
-            if (solver.rows.getPtr(error_variables.positive)) |error_variable_positive_row| {
-                try error_variable_positive_row.addTerm(allocator, variable, -delta);
-            } else if (solver.rows.getPtr(error_variables.negative)) |error_variable_negative_row| {
-                try error_variable_negative_row.addTerm(allocator, variable, delta);
+            if (solver.rows.getPtr(edit_variable.positive_error)) |error_variable_positive_row| {
+                error_variable_positive_row.constant += -delta;
+            } else if (solver.rows.getPtr(edit_variable.negative_error)) |error_variable_negative_row| {
+                error_variable_negative_row.constant += delta;
             } else {
                 for (solver.rows.values()) |*dest_row| {
                     dest_row.constant +=
-                        delta * (row.terms.get(error_variables.positive) orelse continue);
+                        delta * (row.terms.get(edit_variable.positive_error) orelse continue);
                 }
             }
 
             try solver.dualOptimize(allocator);
         }
+
+        // TODO: removeConstraint
     };
 }
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
 
-    const MySolver = Solver(f32);
-    var solver: MySolver = .{};
+    const allocator = gpa.allocator();
+
+    var solver: Solver(f32) = .{};
+    defer solver.deinit(allocator);
 
     const x_m = solver.newExternalVariable();
     const x_l = solver.newExternalVariable();
     const x_r = solver.newExternalVariable();
-    const upper_bound = solver.newExternalVariable();
+    var upper_bound = try solver.addEditVariable(allocator, strengths.strong, 100);
 
-    const variables = .{ .x_m = x_m, .x_l = x_l, .x_r = x_r, .upper_bound = upper_bound };
+    const variables = .{ .x_m = x_m, .x_l = x_l, .x_r = x_r, .upper_bound = upper_bound.variable };
+
+    var buffer_row: Solver(f32).Row = .{};
+    defer buffer_row.deinit(allocator);
 
     try solver.addConstraint(allocator, try .parse(
         allocator,
+        &buffer_row,
         strengths.strong,
         "2.0 * x_m = x_l + x_r",
         variables,
@@ -702,6 +761,7 @@ pub fn main() !void {
 
     try solver.addConstraint(allocator, try .parse(
         allocator,
+        &buffer_row,
         strengths.strong,
         "x_l + 10.0 <= x_r",
         variables,
@@ -709,6 +769,7 @@ pub fn main() !void {
 
     try solver.addConstraint(allocator, try .parse(
         allocator,
+        &buffer_row,
         strengths.strong,
         "x_l >= -10.0",
         variables,
@@ -716,15 +777,9 @@ pub fn main() !void {
 
     try solver.addConstraint(allocator, try .parse(
         allocator,
+        &buffer_row,
         strengths.strong,
         "x_r <= upper_bound",
-        variables,
-    ));
-
-    try solver.addConstraint(allocator, try .parse(
-        allocator,
-        strengths.strong,
-        "upper_bound = 100.0",
         variables,
     ));
 
@@ -734,7 +789,7 @@ pub fn main() !void {
     std.log.info("x_l = {d}", .{solver.getValue(x_l)});
     std.log.info("x_r = {d}", .{solver.getValue(x_r)});
 
-    try solver.suggestValue(allocator, upper_bound, 105);
+    try solver.suggestValue(allocator, &upper_bound, 300);
 
     try solver.debugPrint(std.io.getStdOut().writer());
 
