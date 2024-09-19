@@ -19,26 +19,16 @@ pub fn main() !void {
     const box_width = solver.newExternalVariable();
     var window_width = try solver.addEditVariable(allocator, cassowary.strengths.strong, 0);
 
-    const variables = .{ .box_width = box_width, .window_width = window_width.variable };
-
     var buffer_row: Solver.Row = .{};
     defer buffer_row.deinit(allocator);
 
-    try solver.addConstraint(allocator, try .parse(
-        allocator,
-        &buffer_row,
-        cassowary.strengths.strong,
-        "box_width = 0.5 * window_width",
-        variables,
-    ));
-
-    try solver.addConstraint(allocator, try .parse(
-        allocator,
-        &buffer_row,
-        cassowary.strengths.strong,
-        "box_width >= 200.0",
-        variables,
-    ));
+    try solver.parseAndAddConstraints(allocator, &buffer_row, .{
+        .{ cassowary.strengths.strong, "box_width <= 0.5 * window_width" },
+        .{ cassowary.strengths.strong, "box_width >= 200.0" },
+    }, .{
+        .box_width = box_width,
+        .window_width = window_width.variable,
+    });
 
     try solver.debugPrint(std.io.getStdOut().writer());
 

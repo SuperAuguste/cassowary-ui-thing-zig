@@ -564,6 +564,26 @@ pub fn Solver(comptime Float: type) type {
             return solver.addConstraintInternal(allocator, constraint, null);
         }
 
+        pub fn parseAndAddConstraints(
+            solver: *@This(),
+            allocator: Allocator,
+            buffer_row: *Row,
+            strengths_and_constraints: anytype,
+            variables: anytype,
+        ) !void {
+            inline for (strengths_and_constraints) |entry| {
+                const strength, const constraint = entry;
+
+                try solver.addConstraint(allocator, try .parse(
+                    allocator,
+                    buffer_row,
+                    strength,
+                    constraint,
+                    variables,
+                ));
+            }
+        }
+
         pub fn addEditVariable(
             solver: *@This(),
             allocator: Allocator,
